@@ -14,6 +14,7 @@
  *
  */
 
+import groovy.json.JsonSlurper
 
 metadata {
 	definition (name: "HE Tasmota Mqtt DH", namespace: "hy", author: "H. Yi") {
@@ -26,6 +27,7 @@ metadata {
 preferences {
 	input("ip", "text", title: "MQTT Broker IP Address", description: "IP Address of MQTT Broker that Tasmota devices connect to", required: true)
 	input("port", "text", title: "MQTT Brober Port", description: "Port of MQTT Broker that Tasmota devices connect to", defaultValue: 1883, required: true)
+	input("subinterval", "integer", title: "Subscribe update interval", description: "Refresh MQTT subscription in specified internval, 0-disable refresh", defaultValue: 3600, required: true)
 	input("debugLogEnable", "bool", title: "Enable debug logging", defaultValue: false)
 }
 
@@ -39,7 +41,7 @@ void installed()
 void parse(String description)
 {
 	def msg = interfaces.mqtt.parseMessage(description)
-//	if (debugLogEnable ) log.debug "Parsed Message:" + msg
+	if (debugLogEnable ) log.debug "Parsed Message:" + msg
 	def matcher = msg.topic =~ /^(tele|cmnd|stat)\/(tasmota_([a-zA-Z0-9]+)_([0-9A-Fa-f]{12}))\/(.*)$/;
 	def type = ""
 	def id = ""
@@ -85,7 +87,7 @@ void parse(String description)
 			state.devTopic[id] = topic
 		}
 	}
-	dhtype = child.getTypeName()	
+	dhtype = child.getTypeName()
 	if ( dhtype == "HE Tasmota Mqtt Multi-Switch DH" ) {
 		// custom processing
 		child.parse( [type,cmd,msg.payload])
@@ -124,12 +126,17 @@ void initialize()
 		mqttInt.connect("tcp://${ip}:${port}", "tasmotamqtt", null, null)
 		//give it a chance to start
 		log.info "connection established"
-		sendEvent(name: "connecton", value: "connected")
+		sendEvent(name: "connection", value: "connected")
 		pauseExecution(1000)
 		mqttInt.subscribe("stat/#")
 		mqttInt.subscribe("tele/#")
+		if ( state.subinterval ) {
+			state.mqtthdl = mqttInt;
+			runIn ( state.subinterval, refreshSub )
+		}
 	} catch(e) {
 		log.debug "initialize error: ${e.message}"
+		state.mqtthdl = null
 		reconnectMqtt()
 	}
 }
@@ -140,6 +147,34 @@ void mqttClientStatus(String message)
 	log.info "Received status message ${message}"
 }
 
+def refreshSub()
+{
+	if ( state.mqtthdl ) {
+		log.debug "Refresh subscription"
+		state.mqtthdl.unsubscribe("stat/#")
+		state.mqtthdl.unsubscribe("tele/#")
+		state.mqtthdl.subscribe("stat/#")
+		state.mqtthdl.subscribe("tele/#")
+		if ( state.subinterval ) {
+			runIn ( state.subinterval, refreshSub )
+		}
+	}
+}
+
+def parsePowerFromJson(dev,msg)
+{
+	def decoded = 0
+	def jsonSlurper = new JsonSlurper()
+	def st = jsonSlurper.parseText(msg)
+	st.each { key, val ->
+		if ( key =~ /^POWER\d*$/ ) {
+			dev.sendEvent (name: "switch", value : (val == "OFF" ? "off" : "on"))
+			log.debug "Update switch stat to $val"
+			decoded = 1
+		}
+	}
+	return decoded
+}
 
 def parseSwitch(dev, msg)
 {
@@ -149,9 +184,12 @@ def parseSwitch(dev, msg)
 		log.info "Set switch to ${msg[2]}"
 		decoded = 1
 	}
+	if ( msg[0] == "tele" && msg[1] == "STATE" ) {
+		decoded = parsePowerFromJson(dev,msg[2])
+	}
 	if ( ! decoded && debugLogEnable ) {
 		log.debug "Problem decoding ${msg} for device ${dev.deviceNetworkId}"
-	}	
+	}
 }
 
 
@@ -159,7 +197,7 @@ def sendMqttCmd(networkId, cmd, arg)
 {
 	if ( ! state.devTopic.containsKey(networkId ) ){
 		log.error "Unknown device ID ${networkId}, CMD = ${cmd}, ARG =${arg} ignored"
-		return	
+		return
 	}
 	def topic = state.devTopic[networkId]
 	def pcmd = "cmnd/${topic}/${cmd}"
